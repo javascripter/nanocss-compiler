@@ -11,9 +11,9 @@ pub(crate) fn create_style_object_from_props_args_with_resolver(
 ) -> Expr {
     if let [arg] = args
         && arg.spread.is_none()
-        && can_use_style_expression_directly(&arg.expr)
+        && let Some(style) = single_direct_style_expression(&arg.expr)
     {
-        return resolve_style(&arg.expr).unwrap_or_else(|| (*arg.expr).clone());
+        return resolve_style(style).unwrap_or_else(|| style.clone());
     }
 
     let mut style_properties = Vec::new();
@@ -73,6 +73,34 @@ fn can_use_style_expression_directly(expression: &Expr) -> bool {
         }
         Expr::Paren(expression) => can_use_style_expression_directly(&expression.expr),
         _ => false,
+    }
+}
+
+fn single_direct_style_expression(expression: &Expr) -> Option<&Expr> {
+    let mut expressions = Vec::new();
+    collect_non_falsy_style_expressions(expression, &mut expressions);
+    let [expression] = expressions.as_slice() else {
+        return None;
+    };
+    can_use_style_expression_directly(expression).then_some(*expression)
+}
+
+fn collect_non_falsy_style_expressions<'a>(expression: &'a Expr, expressions: &mut Vec<&'a Expr>) {
+    if let Expr::Array(array) = expression {
+        for element in &array.elems {
+            let Some(element) = element else {
+                continue;
+            };
+            if element.spread.is_some() {
+                panic!("[nanocss] css.props(...) style arrays cannot contain spreads.");
+            }
+            collect_non_falsy_style_expressions(&element.expr, expressions);
+        }
+        return;
+    }
+
+    if !is_falsy_style_expression(expression) {
+        expressions.push(expression);
     }
 }
 

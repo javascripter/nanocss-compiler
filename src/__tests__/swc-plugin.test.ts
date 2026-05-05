@@ -2712,6 +2712,31 @@ describe('nanocss swc plugin', () => {
     `)
   })
 
+  it('reuses direct style expressions for single-item array composition', () => {
+    expect(
+      transform(`
+        import { css } from 'nanocss-compiler'
+
+        function Comp({ style, fallbackStyle }) {
+          return (
+            <>
+              <div {...css.props([style])} />
+              <span {...css.props([[fallbackStyle ?? style]])} />
+            </>
+          )
+        }
+      `),
+    ).toMatchInlineSnapshot(`
+      "function Comp({ style, fallbackStyle }) {
+          return <>
+                    <div style={style}/>
+                    <span style={fallbackStyle ?? style}/>
+                  </>;
+      }
+      "
+    `)
+  })
+
   it('compiles falsy and logical static style composition', () => {
     expect(
       transform(`
