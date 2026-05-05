@@ -46,7 +46,7 @@ use crate::styles::parse_create_arg;
 use crate::variables::{CompiledVariableDefault, CompiledVariableProperty};
 use crate::view_transition::{CompiledViewTransitionClass, compile_view_transition_class};
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 struct StaticStyleRef {
     group_name: String,
     style_name: String,
@@ -678,6 +678,7 @@ impl<'a> NanoCssTransform<'a> {
         if styles.is_empty() {
             return None;
         }
+        dedupe_adjacent_static_style_refs(&mut styles);
         let first_group = &styles[0].group_name;
         if styles.iter().any(|style| style.group_name != *first_group) {
             return None;
@@ -2154,6 +2155,10 @@ fn collect_static_style_refs(
         Expr::Paren(paren) => collect_static_style_refs(&paren.expr, transform, styles),
         _ => None,
     }
+}
+
+fn dedupe_adjacent_static_style_refs(styles: &mut Vec<StaticStyleRef>) {
+    styles.dedup();
 }
 
 fn is_falsy_style_expression(expression: &Expr) -> bool {

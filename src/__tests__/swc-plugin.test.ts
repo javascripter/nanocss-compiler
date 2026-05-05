@@ -186,6 +186,32 @@ describe('nanocss swc plugin', () => {
     `)
   })
 
+  it('dedupes adjacent repeated static style refs', () => {
+    expect(
+      transform(`
+        import { css } from 'nanocss-compiler'
+
+        const styles = css.create({
+          root: {
+            color: getColor(),
+          },
+        })
+
+        function Comp() {
+          return <div {...css.props(styles.root, styles.root)} />
+        }
+      `),
+    ).toMatchInlineSnapshot(`
+      "const _stylesRoot = {
+          color: getColor()
+      };
+      function Comp() {
+          return <div style={_stylesRoot}/>;
+      }
+      "
+    `)
+  })
+
   it('uses style group names in debug helper names', () => {
     expect(
       transform(`
