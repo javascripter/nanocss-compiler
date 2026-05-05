@@ -136,10 +136,9 @@ describe('nanocss swc plugin', () => {
         }
       `),
     ).toMatchInlineSnapshot(`
-      "const marginRight = 8;
-      const _stylesAB = {
+      "const _stylesAB = {
           marginLeft: 0,
-          marginRight,
+          marginRight: 8,
           color: 'blue'
       };
       function Comp() {
@@ -2997,6 +2996,94 @@ describe('nanocss swc plugin', () => {
     `)
   })
 
+  it('inlines local literal constants in compiled style values', () => {
+    expect(
+      transform(`
+        import { css } from 'nanocss-compiler'
+
+        const width = 10
+        const color = 'red'
+        const styles = css.create({
+          root: {
+            width,
+            color,
+          },
+        })
+
+        function Comp() {
+          return <div {...css.props(styles.root)} />
+        }
+      `),
+    ).toMatchInlineSnapshot(`
+      "const _stylesRoot = {
+          width: 10,
+          color: 'red'
+      };
+      function Comp() {
+          return <div style={_stylesRoot}/>;
+      }
+      "
+    `)
+  })
+
+  it('keeps inlined local literal constants when they are still used', () => {
+    expect(
+      transform(`
+        import { css } from 'nanocss-compiler'
+
+        const width = 10
+        const styles = css.create({
+          root: {
+            width,
+          },
+        })
+
+        console.log(width)
+
+        function Comp() {
+          return <div {...css.props(styles.root)} />
+        }
+      `),
+    ).toMatchInlineSnapshot(`
+      "const width = 10;
+      const _stylesRoot = {
+          width: 10
+      };
+      console.log(width);
+      function Comp() {
+          return <div style={_stylesRoot}/>;
+      }
+      "
+    `)
+  })
+
+  it('does not inline local literal constants over dynamic style parameters', () => {
+    expect(
+      transform(`
+        import { css } from 'nanocss-compiler'
+
+        const width = 10
+        const styles = css.create({
+          root: width => ({
+            width,
+          }),
+        })
+
+        function Comp({ width }) {
+          return <div {...css.props(styles.root(width))} />
+        }
+      `),
+    ).toMatchInlineSnapshot(`
+      "const _stylesRoot = (width)=>({
+              width
+          });
+      function Comp({ width }) {
+          return <div style={_stylesRoot(width)}/>;
+      }
+      "
+    `)
+  })
+
   it('preserves overwritten static style value side effects when merging', () => {
     expect(
       transform(`
@@ -3169,9 +3256,8 @@ describe('nanocss swc plugin', () => {
       "const _stylesAA = {
           opacity: 1
       };
-      const width = 10;
       const _stylesBB = {
-          width
+          width: 10
       };
       function Comp() {
           return <div style={{

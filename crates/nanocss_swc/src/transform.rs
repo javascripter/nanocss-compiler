@@ -8,9 +8,9 @@ use swc_core::{
             Callee, CatchClause, Class, CondExpr, Decl, Expr, ExprOrSpread, ForHead, ForInStmt,
             ForOfStmt, ForStmt, Function, Ident, JSXAttr, JSXAttrName, JSXAttrOrSpread,
             JSXAttrValue, JSXClosingElement, JSXElementChild, JSXExpr, JSXExprContainer,
-            JSXOpeningElement, Lit, MemberExpr, MemberProp, Module, ModuleDecl, ModuleItem,
-            ObjectLit, ParenExpr, Pat, Prop, PropName, PropOrSpread, ReturnStmt, Stmt, Str,
-            UnaryOp, VarDecl, VarDeclKind, VarDeclOrExpr, VarDeclarator,
+            JSXOpeningElement, KeyValueProp, Lit, MemberExpr, MemberProp, Module, ModuleDecl,
+            ModuleItem, ObjectLit, ParenExpr, Pat, Prop, PropName, PropOrSpread, ReturnStmt, Stmt,
+            Str, UnaryOp, VarDecl, VarDeclKind, VarDeclOrExpr, VarDeclarator,
         },
         visit::{Visit, VisitMut, VisitMutWith, VisitWith},
     },
@@ -76,6 +76,7 @@ pub(crate) struct NanoCssTransform<'a> {
     merged_style_ids: HashMap<String, String>,
     pending_style_declarations: HashMap<String, Vec<PendingStyleDeclaration>>,
     reserved_helper_names: HashSet<String>,
+    simple_constants: HashMap<String, Expr>,
     html_default_style_ids: HashMap<String, String>,
     html_spread_temp_stack: Vec<Vec<String>>,
     imported_variable_group_names: HashSet<String>,
@@ -120,6 +121,7 @@ impl<'a> NanoCssTransform<'a> {
             merged_style_ids: HashMap::new(),
             pending_style_declarations: HashMap::new(),
             reserved_helper_names: HashSet::new(),
+            simple_constants: HashMap::new(),
             html_default_style_ids: HashMap::new(),
             html_spread_temp_stack: Vec::new(),
             imported_variable_group_names: HashSet::new(),
@@ -419,6 +421,42 @@ impl<'a> NanoCssTransform<'a> {
 
         for index in remove_indices.into_iter().rev() {
             statements.remove(index);
+        }
+    }
+
+    fn remove_unused_simple_constant_declarations(&self, module: &mut Module) {
+        if self.simple_constants.is_empty() {
+            return;
+        }
+
+        let simple_constant_names = self
+            .simple_constants
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let used = collect_used_simple_constant_identifiers(module, &simple_constant_names);
+        let mut remove_indices = Vec::new();
+        for (index, item) in module.body.iter().enumerate() {
+            let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var_decl))) = item else {
+                continue;
+            };
+            if var_decl.kind != VarDeclKind::Const || var_decl.decls.len() != 1 {
+                continue;
+            }
+            let Some(name) = var_decl.decls[0]
+                .name
+                .as_ident()
+                .map(|binding| binding.id.sym.to_string())
+            else {
+                continue;
+            };
+            if simple_constant_names.contains(&name) && !used.contains(&name) {
+                remove_indices.push(index);
+            }
+        }
+
+        for index in remove_indices.into_iter().rev() {
+            module.body.remove(index);
         }
     }
 
@@ -941,6 +979,33 @@ impl<'a> NanoCssTransform<'a> {
         visit(self);
         self.non_top_level_depth -= 1;
     }
+
+    fn record_simple_constant_declarator(&mut self, declarator: &VarDeclarator) {
+        let Some(name) = declarator
+            .name
+            .as_ident()
+            .map(|binding| binding.id.sym.to_string())
+        else {
+            return;
+        };
+        if self.css_names.contains(&name)
+            || self.html_names.contains(&name)
+            || self.style_group_names.contains(&name)
+            || self.variable_groups.contains_key(&name)
+            || self.const_groups.contains_key(&name)
+            || self.generated_string_names.contains_key(&name)
+        {
+            return;
+        }
+        let Some(init) = declarator.init.as_deref() else {
+            return;
+        };
+        let Some(value) = simple_constant_expression(init) else {
+            self.simple_constants.remove(&name);
+            return;
+        };
+        self.simple_constants.insert(name, value);
+    }
 }
 
 impl VisitMut for NanoCssTransform<'_> {
@@ -953,6 +1018,7 @@ impl VisitMut for NanoCssTransform<'_> {
         self.insert_pending_html_default_styles(module);
         self.insert_pending_style_declarations(module);
         self.remove_unused_style_declarations(module);
+        self.remove_unused_simple_constant_declarations(module);
         remove_unused_nanocss_imports(module, &self.options.import_sources);
     }
 
@@ -1300,7 +1366,12 @@ impl VisitMut for NanoCssTransform<'_> {
             }
         }
 
-        declaration.visit_mut_children_with(self);
+        for declarator in &mut declaration.decls {
+            declarator.visit_mut_with(self);
+            if self.non_top_level_depth == 0 && declaration.kind == VarDeclKind::Const {
+                self.record_simple_constant_declarator(declarator);
+            }
+        }
     }
 
     fn visit_mut_var_declarator(&mut self, declarator: &mut VarDeclarator) {
@@ -1489,9 +1560,11 @@ impl VisitMut for NanoCssTransform<'_> {
                 panic!("[nanocss] css.create(...) must be called with a static object expression.");
             }
 
+            let mut create_arg = (*call.args[0].expr).clone();
+            inline_simple_constants(&mut create_arg, &self.simple_constants);
             self.style_group_names.insert(binding_name.clone());
             let compiled = parse_create_arg(
-                &call.args[0].expr,
+                &create_arg,
                 &self.css_names,
                 &self.variable_groups,
                 &self.imported_variable_group_names,
@@ -1783,6 +1856,115 @@ fn create_object_freeze_call(expression: Expr) -> Expr {
     })
 }
 
+fn simple_constant_expression(expression: &Expr) -> Option<Expr> {
+    match expression {
+        Expr::Lit(Lit::Str(_))
+        | Expr::Lit(Lit::Num(_))
+        | Expr::Lit(Lit::Bool(_))
+        | Expr::Lit(Lit::Null(_)) => Some(expression.clone()),
+        Expr::Paren(paren) => simple_constant_expression(&paren.expr),
+        _ => None,
+    }
+}
+
+fn inline_simple_constants(expression: &mut Expr, constants: &HashMap<String, Expr>) {
+    if constants.is_empty() {
+        return;
+    }
+    expression.visit_mut_with(&mut SimpleConstantInliner {
+        constants,
+        shadowed: Vec::new(),
+    });
+}
+
+struct SimpleConstantInliner<'a> {
+    constants: &'a HashMap<String, Expr>,
+    shadowed: Vec<String>,
+}
+
+impl SimpleConstantInliner<'_> {
+    fn is_visible_constant(&self, name: &str) -> bool {
+        self.constants.contains_key(name) && !self.shadowed.iter().any(|shadowed| shadowed == name)
+    }
+
+    fn with_shadowed_names(&mut self, shadowed: HashSet<String>, visit: impl FnOnce(&mut Self)) {
+        let previous_len = self.shadowed.len();
+        self.shadowed.extend(shadowed);
+        visit(self);
+        self.shadowed.truncate(previous_len);
+    }
+}
+
+impl VisitMut for SimpleConstantInliner<'_> {
+    fn visit_mut_expr(&mut self, expression: &mut Expr) {
+        if let Expr::Ident(identifier) = expression
+            && self.is_visible_constant(identifier.sym.as_ref())
+            && let Some(value) = self.constants.get(identifier.sym.as_ref())
+        {
+            *expression = value.clone();
+            return;
+        }
+
+        match expression {
+            Expr::Member(_) => {}
+            _ => expression.visit_mut_children_with(self),
+        }
+    }
+
+    fn visit_mut_call_expr(&mut self, call: &mut CallExpr) {
+        for arg in &mut call.args {
+            arg.expr.visit_mut_with(self);
+        }
+    }
+
+    fn visit_mut_key_value_prop(&mut self, property: &mut KeyValueProp) {
+        property.value.visit_mut_with(self);
+    }
+
+    fn visit_mut_prop(&mut self, property: &mut Prop) {
+        if let Prop::Shorthand(identifier) = property
+            && self.is_visible_constant(identifier.sym.as_ref())
+            && let Some(value) = self.constants.get(identifier.sym.as_ref())
+        {
+            *property = Prop::KeyValue(KeyValueProp {
+                key: PropName::Ident(identifier.sym.clone().into()),
+                value: Box::new(value.clone()),
+            });
+            return;
+        }
+
+        property.visit_mut_children_with(self);
+    }
+
+    fn visit_mut_function(&mut self, function: &mut Function) {
+        let mut shadowed = HashSet::new();
+        let constant_names = self.constants.keys().cloned().collect::<HashSet<_>>();
+        for param in &function.params {
+            collect_shadowed_css_names(&param.pat, &constant_names, &mut shadowed);
+        }
+        if let Some(body) = &function.body {
+            collect_shadowed_var_names_from_function_body(body, &constant_names, &mut shadowed);
+        }
+        self.with_shadowed_names(shadowed, |visitor| {
+            function.visit_mut_children_with(visitor);
+        });
+    }
+
+    fn visit_mut_arrow_expr(&mut self, arrow: &mut ArrowExpr) {
+        let mut shadowed = HashSet::new();
+        let constant_names = self.constants.keys().cloned().collect::<HashSet<_>>();
+        for param in &arrow.params {
+            collect_shadowed_css_names(param, &constant_names, &mut shadowed);
+        }
+        if let BlockStmtOrExpr::BlockStmt(body) = &*arrow.body {
+            collect_shadowed_var_names_from_function_body(body, &constant_names, &mut shadowed);
+        }
+        self.with_shadowed_names(shadowed, |visitor| {
+            arrow.visit_mut_children_with(visitor);
+        });
+    }
+}
+
 fn is_compiled_css_module_source(source: &str) -> bool {
     source.ends_with(".css")
         || source.ends_with(".css.ts")
@@ -2013,6 +2195,82 @@ impl Visit for StyleIdentifierUsageCollector<'_> {
         if self.targets.contains(&name) {
             self.used.insert(name);
         }
+    }
+}
+
+fn collect_used_simple_constant_identifiers(
+    module: &Module,
+    targets: &HashSet<String>,
+) -> HashSet<String> {
+    let mut collector = SimpleConstantUsageCollector {
+        targets,
+        used: HashSet::new(),
+        shadowed: Vec::new(),
+    };
+
+    for item in &module.body {
+        if matches!(item, ModuleItem::ModuleDecl(ModuleDecl::Import(_))) {
+            continue;
+        }
+        item.visit_with(&mut collector);
+    }
+
+    collector.used
+}
+
+struct SimpleConstantUsageCollector<'a> {
+    targets: &'a HashSet<String>,
+    used: HashSet<String>,
+    shadowed: Vec<String>,
+}
+
+impl SimpleConstantUsageCollector<'_> {
+    fn is_visible_target(&self, name: &str) -> bool {
+        self.targets.contains(name) && !self.shadowed.iter().any(|shadowed| shadowed == name)
+    }
+
+    fn with_shadowed_names(&mut self, shadowed: HashSet<String>, visit: impl FnOnce(&mut Self)) {
+        let previous_len = self.shadowed.len();
+        self.shadowed.extend(shadowed);
+        visit(self);
+        self.shadowed.truncate(previous_len);
+    }
+}
+
+impl Visit for SimpleConstantUsageCollector<'_> {
+    fn visit_binding_ident(&mut self, _binding: &BindingIdent) {}
+
+    fn visit_ident(&mut self, ident: &Ident) {
+        let name = ident.sym.to_string();
+        if self.is_visible_target(&name) {
+            self.used.insert(name);
+        }
+    }
+
+    fn visit_function(&mut self, function: &Function) {
+        let mut shadowed = HashSet::new();
+        for param in &function.params {
+            collect_shadowed_css_names(&param.pat, self.targets, &mut shadowed);
+        }
+        if let Some(body) = &function.body {
+            collect_shadowed_var_names_from_function_body(body, self.targets, &mut shadowed);
+        }
+        self.with_shadowed_names(shadowed, |collector| {
+            function.visit_children_with(collector);
+        });
+    }
+
+    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+        let mut shadowed = HashSet::new();
+        for param in &arrow.params {
+            collect_shadowed_css_names(param, self.targets, &mut shadowed);
+        }
+        if let BlockStmtOrExpr::BlockStmt(body) = &*arrow.body {
+            collect_shadowed_var_names_from_function_body(body, self.targets, &mut shadowed);
+        }
+        self.with_shadowed_names(shadowed, |collector| {
+            arrow.visit_children_with(collector);
+        });
     }
 }
 
