@@ -3099,6 +3099,36 @@ describe('nanocss swc plugin', () => {
     `)
   })
 
+  it('inlines signed local numeric constants in compiled style values', () => {
+    expect(
+      transform(`
+        import { css } from 'nanocss-compiler'
+
+        const marginLeft = -8
+        const zIndex = +2
+        const styles = css.create({
+          root: {
+            marginLeft,
+            zIndex,
+          },
+        })
+
+        function Comp() {
+          return <div {...css.props(styles.root)} />
+        }
+      `),
+    ).toMatchInlineSnapshot(`
+      "const _stylesRoot = {
+          marginLeft: -8,
+          zIndex: 2
+      };
+      function Comp() {
+          return <div style={_stylesRoot}/>;
+      }
+      "
+    `)
+  })
+
   it('does not inline local literal constants over dynamic style parameters', () => {
     expect(
       transform(`

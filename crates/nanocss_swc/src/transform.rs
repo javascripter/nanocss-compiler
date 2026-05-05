@@ -9,8 +9,8 @@ use swc_core::{
             ForOfStmt, ForStmt, Function, Ident, JSXAttr, JSXAttrName, JSXAttrOrSpread,
             JSXAttrValue, JSXClosingElement, JSXElementChild, JSXExpr, JSXExprContainer,
             JSXOpeningElement, KeyValueProp, Lit, MemberExpr, MemberProp, Module, ModuleDecl,
-            ModuleItem, ObjectLit, ParenExpr, Pat, Prop, PropName, PropOrSpread, ReturnStmt, Stmt,
-            Str, UnaryOp, VarDecl, VarDeclKind, VarDeclOrExpr, VarDeclarator,
+            ModuleItem, Number, ObjectLit, ParenExpr, Pat, Prop, PropName, PropOrSpread,
+            ReturnStmt, Stmt, Str, UnaryOp, VarDecl, VarDeclKind, VarDeclOrExpr, VarDeclarator,
         },
         visit::{Visit, VisitMut, VisitMutWith, VisitWith},
     },
@@ -1862,9 +1862,38 @@ fn simple_constant_expression(expression: &Expr) -> Option<Expr> {
         | Expr::Lit(Lit::Num(_))
         | Expr::Lit(Lit::Bool(_))
         | Expr::Lit(Lit::Null(_)) => Some(expression.clone()),
+        Expr::Unary(unary)
+            if matches!(unary.op, UnaryOp::Minus | UnaryOp::Plus)
+                && numeric_literal_value(&unary.arg).is_some() =>
+        {
+            Some(number_expression(
+                numeric_literal_value(&unary.arg).expect("checked numeric literal")
+                    * if unary.op == UnaryOp::Minus {
+                        -1.0
+                    } else {
+                        1.0
+                    },
+            ))
+        }
         Expr::Paren(paren) => simple_constant_expression(&paren.expr),
         _ => None,
     }
+}
+
+fn numeric_literal_value(expression: &Expr) -> Option<f64> {
+    match expression {
+        Expr::Lit(Lit::Num(value)) => Some(value.value),
+        Expr::Paren(paren) => numeric_literal_value(&paren.expr),
+        _ => None,
+    }
+}
+
+fn number_expression(value: f64) -> Expr {
+    Expr::Lit(Lit::Num(Number {
+        span: DUMMY_SP,
+        value,
+        raw: None,
+    }))
 }
 
 fn inline_simple_constants(expression: &mut Expr, constants: &HashMap<String, Expr>) {
