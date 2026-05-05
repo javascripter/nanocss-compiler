@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::{
     keyframes::CompiledKeyframes,
     position_try::CompiledPositionTry,
@@ -16,21 +18,22 @@ pub(crate) fn create_style_sheet(
 ) -> String {
     let newline = if debug { "\n" } else { "" };
     let mut css = Vec::new();
+    let mut seen_css = HashSet::new();
 
     if !hook_css.is_empty() {
-        css.push(hook_css.to_string());
+        push_unique_css(&mut css, &mut seen_css, hook_css.to_string());
     }
 
     for keyframes in keyframes {
-        css.push(keyframes.css.clone());
+        push_unique_css(&mut css, &mut seen_css, keyframes.css.clone());
     }
 
     for position_try in position_tries {
-        css.push(position_try.css.clone());
+        push_unique_css(&mut css, &mut seen_css, position_try.css.clone());
     }
 
     for view_transition_class in view_transition_classes {
-        css.push(view_transition_class.css.clone());
+        push_unique_css(&mut css, &mut seen_css, view_transition_class.css.clone());
     }
 
     for property in variable_properties {
@@ -39,7 +42,9 @@ pub(crate) fn create_style_sheet(
         } else {
             ("", "", "")
         };
-        css.push(
+        push_unique_css(
+            &mut css,
+            &mut seen_css,
             [
                 format!("@property {}{space}{{", property.custom_property_name),
                 format!("{indent}syntax:{space}\"{}\";", property.syntax),
@@ -61,10 +66,16 @@ pub(crate) fn create_style_sheet(
             ));
         }
         defaults.push("}".to_string());
-        css.push(defaults.join(newline));
+        push_unique_css(&mut css, &mut seen_css, defaults.join(newline));
     }
 
     css.join(newline)
+}
+
+fn push_unique_css(css: &mut Vec<String>, seen_css: &mut HashSet<String>, chunk: String) {
+    if seen_css.insert(chunk.clone()) {
+        css.push(chunk);
+    }
 }
 
 #[cfg(test)]
@@ -103,5 +114,29 @@ mod tests {
             style_sheet,
             "@keyframes fade {}\n@position-try --fallback {}\n::view-transition-new(*.transition) {}\n@property --color {\n  syntax: \"<color>\";\n  inherits: true;\n  initial-value: green;\n}\n* {\n  --color--nd: green;\n}"
         );
+    }
+
+    #[test]
+    fn dedupes_identical_generated_css_chunks() {
+        let style_sheet = create_style_sheet(
+            "",
+            &[
+                CompiledKeyframes {
+                    name: "fade".to_string(),
+                    css: "@keyframes fade {}".to_string(),
+                },
+                CompiledKeyframes {
+                    name: "fade".to_string(),
+                    css: "@keyframes fade {}".to_string(),
+                },
+            ],
+            &[],
+            &[],
+            &[],
+            &[],
+            true,
+        );
+
+        assert_eq!(style_sheet, "@keyframes fade {}");
     }
 }

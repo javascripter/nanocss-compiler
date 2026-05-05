@@ -331,6 +331,43 @@ describe('nanocss swc plugin', () => {
     `)
   })
 
+  it('dedupes identical generated css metadata blocks', () => {
+    const result = transformWithMetadata(`
+      import { css } from 'nanocss-compiler'
+
+      const fadeIn = css.keyframes({
+        from: { opacity: 0 },
+        to: { opacity: 1 },
+      })
+
+      const alsoFadeIn = css.keyframes({
+        from: { opacity: 0 },
+        to: { opacity: 1 },
+      })
+
+      const styles = css.create({
+        root: {
+          animationName: fadeIn,
+        },
+        other: {
+          animationName: alsoFadeIn,
+        },
+      })
+
+      function Comp() {
+        return <div {...css.props(styles.root, styles.other)} />
+      }
+    `)
+
+    expect(result?.code).toContain('const fadeIn = "__nanocss_keyframes-firn26"')
+    expect(result?.code).toContain(
+      'const alsoFadeIn = "__nanocss_keyframes-firn26"',
+    )
+    expect(
+      (result?.metadata as any).nanocss.styleSheet.match(/@keyframes/g),
+    ).toHaveLength(1)
+  })
+
   it('uses short generated keyframe names outside debug mode', () => {
     const result = transformWithMetadata(
       `
