@@ -73,6 +73,7 @@ pub(crate) struct NanoCssTransform<'a> {
     style_group_names: HashSet<String>,
     static_style_groups: HashMap<String, HashMap<String, Expr>>,
     dynamic_style_groups: HashMap<String, HashMap<String, DynamicStyleMember>>,
+    mergeable_static_style_tuples: HashSet<String>,
     merged_style_ids: HashMap<String, String>,
     pending_style_declarations: HashMap<String, Vec<PendingStyleDeclaration>>,
     reserved_helper_names: HashSet<String>,
@@ -118,6 +119,7 @@ impl<'a> NanoCssTransform<'a> {
             style_group_names: HashSet::new(),
             static_style_groups: HashMap::new(),
             dynamic_style_groups: HashMap::new(),
+            mergeable_static_style_tuples: HashSet::new(),
             merged_style_ids: HashMap::new(),
             pending_style_declarations: HashMap::new(),
             reserved_helper_names: HashSet::new(),
@@ -532,11 +534,7 @@ impl<'a> NanoCssTransform<'a> {
     }
 
     fn static_style_cache_key(&self, styles: &[StaticStyleRef]) -> String {
-        styles
-            .iter()
-            .map(|style| format!("{}.{}", style.group_name, style.style_name))
-            .collect::<Vec<_>>()
-            .join("\0")
+        static_style_refs_cache_key(styles)
     }
 
     fn next_style_id(&mut self, styles: &[StaticStyleRef]) -> String {
@@ -727,6 +725,12 @@ impl<'a> NanoCssTransform<'a> {
         let first_group = &styles[0].group_name;
         if styles.iter().any(|style| style.group_name != *first_group) {
             return None;
+        }
+        if styles.len() > 1 {
+            let cache_key = self.static_style_cache_key(&styles);
+            if !self.mergeable_static_style_tuples.contains(&cache_key) {
+                return None;
+            }
         }
         Some(self.register_static_style_segment(&styles))
     }
@@ -1060,6 +1064,9 @@ impl VisitMut for NanoCssTransform<'_> {
             .extend(collect_binding_names_from_module(module));
         self.collect_imports(module);
         self.validate_exported_css_module_declarations(module);
+        let static_style_members = collect_static_create_style_members(module, &self.css_names);
+        self.mergeable_static_style_tuples =
+            collect_mergeable_static_style_tuples(module, &self.css_names, &static_style_members);
         module.visit_mut_children_with(self);
         self.insert_pending_html_default_styles(module);
         self.insert_pending_style_declarations(module);
@@ -2172,6 +2179,550 @@ fn style_declaration_to_statement(declaration: PendingStyleDeclaration) -> Stmt 
     })))
 }
 
+fn collect_static_create_style_members(
+    module: &Module,
+    css_names: &HashSet<String>,
+) -> HashMap<String, HashSet<String>> {
+    let mut groups = HashMap::new();
+    for item in &module.body {
+        match item {
+            ModuleItem::Stmt(Stmt::Decl(Decl::Var(var_decl))) => {
+                collect_static_create_style_members_from_var_decl(var_decl, css_names, &mut groups);
+            }
+            ModuleItem::ModuleDecl(ModuleDecl::ExportDecl(export_decl)) => {
+                if let Decl::Var(var_decl) = &export_decl.decl {
+                    collect_static_create_style_members_from_var_decl(
+                        var_decl,
+                        css_names,
+                        &mut groups,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    groups
+}
+
+fn collect_static_create_style_members_from_var_decl(
+    var_decl: &VarDecl,
+    css_names: &HashSet<String>,
+    groups: &mut HashMap<String, HashSet<String>>,
+) {
+    for declarator in &var_decl.decls {
+        let Some(group_name) = declarator
+            .name
+            .as_ident()
+            .map(|binding| binding.id.sym.to_string())
+        else {
+            continue;
+        };
+        let Some(Expr::Call(call)) = declarator.init.as_deref() else {
+            continue;
+        };
+        if !is_css_member_call(css_names, &call.callee, "create")
+            || call.args.len() != 1
+            || call.args[0].spread.is_some()
+        {
+            continue;
+        }
+        let Expr::Object(object) = &*call.args[0].expr else {
+            continue;
+        };
+        let members = object
+            .props
+            .iter()
+            .filter_map(|property| {
+                let PropOrSpread::Prop(property) = property else {
+                    return None;
+                };
+                let Prop::KeyValue(property) = &**property else {
+                    return None;
+                };
+                if !matches!(&*property.value, Expr::Object(_)) {
+                    return None;
+                }
+                prop_name_to_string(&property.key)
+            })
+            .collect::<HashSet<_>>();
+        if !members.is_empty() {
+            groups.insert(group_name, members);
+        }
+    }
+}
+
+struct StaticStyleTupleUsage {
+    count: usize,
+    styles: Vec<StaticStyleRef>,
+}
+
+struct StaticStyleMemberTupleState {
+    tuple_key: Option<String>,
+    mixed: bool,
+}
+
+fn collect_mergeable_static_style_tuples(
+    module: &Module,
+    css_names: &HashSet<String>,
+    static_style_members: &HashMap<String, HashSet<String>>,
+) -> HashSet<String> {
+    let style_group_names = static_style_members.keys().cloned().collect::<HashSet<_>>();
+    let mut collector = StaticStyleTupleCollector {
+        css_names,
+        static_style_members,
+        style_group_names: &style_group_names,
+        tuple_usages: HashMap::new(),
+        member_states: HashMap::new(),
+        shadowed_css: Vec::new(),
+        shadowed_styles: Vec::new(),
+    };
+
+    for item in &module.body {
+        if matches!(item, ModuleItem::ModuleDecl(ModuleDecl::Import(_))) {
+            continue;
+        }
+        item.visit_with(&mut collector);
+    }
+
+    collector
+        .tuple_usages
+        .into_iter()
+        .filter_map(|(tuple_key, usage)| {
+            if usage.count < 2 || usage.styles.len() < 2 {
+                return None;
+            }
+            let is_closed = usage.styles.iter().all(|style| {
+                let member_key = static_style_member_key(style);
+                collector
+                    .member_states
+                    .get(&member_key)
+                    .is_some_and(|state| {
+                        !state.mixed && state.tuple_key.as_deref() == Some(&tuple_key)
+                    })
+            });
+            is_closed.then_some(tuple_key)
+        })
+        .collect()
+}
+
+struct StaticStyleTupleCollector<'a> {
+    css_names: &'a HashSet<String>,
+    static_style_members: &'a HashMap<String, HashSet<String>>,
+    style_group_names: &'a HashSet<String>,
+    tuple_usages: HashMap<String, StaticStyleTupleUsage>,
+    member_states: HashMap<String, StaticStyleMemberTupleState>,
+    shadowed_css: Vec<String>,
+    shadowed_styles: Vec<String>,
+}
+
+impl StaticStyleTupleCollector<'_> {
+    fn is_visible_css_name(&self, name: &str) -> bool {
+        self.css_names.contains(name) && !self.shadowed_css.iter().any(|shadowed| shadowed == name)
+    }
+
+    fn is_visible_style_group(&self, name: &str) -> bool {
+        self.static_style_members.contains_key(name)
+            && !self.shadowed_styles.iter().any(|shadowed| shadowed == name)
+    }
+
+    fn is_visible_props_call(&self, call: &CallExpr) -> bool {
+        let Callee::Expr(callee) = &call.callee else {
+            return false;
+        };
+        let Expr::Member(member) = &**callee else {
+            return false;
+        };
+        let Expr::Ident(object) = &*member.obj else {
+            return false;
+        };
+        self.is_visible_css_name(&object.sym.to_string()) && member.prop.is_ident_with("props")
+    }
+
+    fn record_tuple_usage(&mut self, styles: Vec<StaticStyleRef>) {
+        let tuple_key = static_style_refs_cache_key(&styles);
+        self.tuple_usages
+            .entry(tuple_key.clone())
+            .and_modify(|usage| usage.count += 1)
+            .or_insert_with(|| StaticStyleTupleUsage {
+                count: 1,
+                styles: styles.clone(),
+            });
+
+        for style in styles {
+            let member_key = static_style_member_key(&style);
+            let state = self.member_states.entry(member_key).or_insert_with(|| {
+                StaticStyleMemberTupleState {
+                    tuple_key: None,
+                    mixed: false,
+                }
+            });
+            if let Some(existing) = &state.tuple_key {
+                if existing != &tuple_key {
+                    state.mixed = true;
+                }
+            } else if !state.mixed {
+                state.tuple_key = Some(tuple_key.clone());
+            }
+        }
+    }
+
+    fn record_ambiguous_usage(&mut self, style: StaticStyleRef) {
+        self.member_states
+            .entry(static_style_member_key(&style))
+            .and_modify(|state| state.mixed = true)
+            .or_insert(StaticStyleMemberTupleState {
+                tuple_key: None,
+                mixed: true,
+            });
+    }
+
+    fn with_shadowed_names(
+        &mut self,
+        shadowed_css: HashSet<String>,
+        shadowed_styles: HashSet<String>,
+        visit: impl FnOnce(&mut Self),
+    ) {
+        let previous_css_len = self.shadowed_css.len();
+        let previous_styles_len = self.shadowed_styles.len();
+        self.shadowed_css.extend(shadowed_css);
+        self.shadowed_styles.extend(shadowed_styles);
+        visit(self);
+        self.shadowed_css.truncate(previous_css_len);
+        self.shadowed_styles.truncate(previous_styles_len);
+    }
+
+    fn collect_function_shadowed_names(
+        &self,
+        function: &Function,
+    ) -> (HashSet<String>, HashSet<String>) {
+        let mut shadowed_css = HashSet::new();
+        let mut shadowed_styles = HashSet::new();
+        for param in &function.params {
+            collect_shadowed_css_names(&param.pat, self.css_names, &mut shadowed_css);
+            collect_shadowed_css_names(&param.pat, self.style_group_names, &mut shadowed_styles);
+        }
+        if let Some(body) = &function.body {
+            collect_shadowed_var_names_from_function_body(body, self.css_names, &mut shadowed_css);
+            collect_shadowed_var_names_from_function_body(
+                body,
+                self.style_group_names,
+                &mut shadowed_styles,
+            );
+        }
+        (shadowed_css, shadowed_styles)
+    }
+
+    fn collect_arrow_shadowed_names(
+        &self,
+        arrow: &ArrowExpr,
+    ) -> (HashSet<String>, HashSet<String>) {
+        let mut shadowed_css = HashSet::new();
+        let mut shadowed_styles = HashSet::new();
+        for param in &arrow.params {
+            collect_shadowed_css_names(param, self.css_names, &mut shadowed_css);
+            collect_shadowed_css_names(param, self.style_group_names, &mut shadowed_styles);
+        }
+        if let BlockStmtOrExpr::BlockStmt(body) = &*arrow.body {
+            collect_shadowed_var_names_from_function_body(body, self.css_names, &mut shadowed_css);
+            collect_shadowed_var_names_from_function_body(
+                body,
+                self.style_group_names,
+                &mut shadowed_styles,
+            );
+        }
+        (shadowed_css, shadowed_styles)
+    }
+
+    fn collect_block_shadowed_names(
+        &self,
+        block: &BlockStmt,
+    ) -> (HashSet<String>, HashSet<String>) {
+        let mut shadowed_css = HashSet::new();
+        let mut shadowed_styles = HashSet::new();
+        for statement in &block.stmts {
+            collect_shadowed_css_names_from_statement(statement, self.css_names, &mut shadowed_css);
+            collect_shadowed_css_names_from_statement(
+                statement,
+                self.style_group_names,
+                &mut shadowed_styles,
+            );
+        }
+        (shadowed_css, shadowed_styles)
+    }
+}
+
+impl Visit for StaticStyleTupleCollector<'_> {
+    fn visit_binding_ident(&mut self, _binding: &BindingIdent) {}
+
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        if self.is_visible_props_call(call) {
+            if let Some(mut styles) =
+                collect_static_style_tuple_from_props_args(call.args.as_slice(), self)
+            {
+                if !styles.is_empty() {
+                    dedupe_adjacent_static_style_refs(&mut styles);
+                    self.record_tuple_usage(styles);
+                }
+            } else {
+                let mut refs = Vec::new();
+                let mut groups = HashSet::new();
+                for arg in &call.args {
+                    collect_static_style_refs_for_tuple_analysis(
+                        &arg.expr,
+                        self,
+                        &mut refs,
+                        &mut groups,
+                    );
+                }
+                for style in refs {
+                    self.record_ambiguous_usage(style);
+                }
+                for group_name in groups {
+                    if let Some(members) = self.static_style_members.get(&group_name) {
+                        for style_name in members {
+                            self.record_ambiguous_usage(StaticStyleRef {
+                                group_name: group_name.clone(),
+                                style_name: style_name.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        call.visit_children_with(self);
+    }
+
+    fn visit_function(&mut self, function: &Function) {
+        let (shadowed_css, shadowed_styles) = self.collect_function_shadowed_names(function);
+        self.with_shadowed_names(shadowed_css, shadowed_styles, |collector| {
+            function.visit_children_with(collector);
+        });
+    }
+
+    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+        let (shadowed_css, shadowed_styles) = self.collect_arrow_shadowed_names(arrow);
+        self.with_shadowed_names(shadowed_css, shadowed_styles, |collector| {
+            arrow.visit_children_with(collector);
+        });
+    }
+
+    fn visit_block_stmt(&mut self, block: &BlockStmt) {
+        let (shadowed_css, shadowed_styles) = self.collect_block_shadowed_names(block);
+        self.with_shadowed_names(shadowed_css, shadowed_styles, |collector| {
+            block.visit_children_with(collector);
+        });
+    }
+
+    fn visit_catch_clause(&mut self, clause: &CatchClause) {
+        let mut shadowed_css = HashSet::new();
+        let mut shadowed_styles = HashSet::new();
+        if let Some(param) = &clause.param {
+            collect_shadowed_css_names(param, self.css_names, &mut shadowed_css);
+            collect_shadowed_css_names(param, self.style_group_names, &mut shadowed_styles);
+        }
+        self.with_shadowed_names(shadowed_css, shadowed_styles, |collector| {
+            clause.visit_children_with(collector);
+        });
+    }
+
+    fn visit_for_stmt(&mut self, statement: &ForStmt) {
+        let mut shadowed_css = HashSet::new();
+        let mut shadowed_styles = HashSet::new();
+        if let Some(init) = &statement.init {
+            match init {
+                VarDeclOrExpr::VarDecl(declaration) => {
+                    collect_shadowed_names_from_var_decl(
+                        declaration,
+                        self.css_names,
+                        &mut shadowed_css,
+                    );
+                    collect_shadowed_names_from_var_decl(
+                        declaration,
+                        self.style_group_names,
+                        &mut shadowed_styles,
+                    );
+                }
+                VarDeclOrExpr::Expr(_) => {}
+                #[cfg(swc_ast_unknown)]
+                _ => panic!("[nanocss] Unknown SWC for init."),
+            }
+        }
+        self.with_shadowed_names(shadowed_css, shadowed_styles, |collector| {
+            statement.visit_children_with(collector);
+        });
+    }
+
+    fn visit_for_in_stmt(&mut self, statement: &ForInStmt) {
+        let mut shadowed_css = HashSet::new();
+        let mut shadowed_styles = HashSet::new();
+        collect_shadowed_names_from_for_head(&statement.left, self.css_names, &mut shadowed_css);
+        collect_shadowed_names_from_for_head(
+            &statement.left,
+            self.style_group_names,
+            &mut shadowed_styles,
+        );
+        self.with_shadowed_names(shadowed_css, shadowed_styles, |collector| {
+            statement.visit_children_with(collector);
+        });
+    }
+
+    fn visit_for_of_stmt(&mut self, statement: &ForOfStmt) {
+        let mut shadowed_css = HashSet::new();
+        let mut shadowed_styles = HashSet::new();
+        collect_shadowed_names_from_for_head(&statement.left, self.css_names, &mut shadowed_css);
+        collect_shadowed_names_from_for_head(
+            &statement.left,
+            self.style_group_names,
+            &mut shadowed_styles,
+        );
+        self.with_shadowed_names(shadowed_css, shadowed_styles, |collector| {
+            statement.visit_children_with(collector);
+        });
+    }
+}
+
+fn collect_static_style_tuple_from_props_args(
+    args: &[ExprOrSpread],
+    collector: &StaticStyleTupleCollector,
+) -> Option<Vec<StaticStyleRef>> {
+    let mut styles = Vec::new();
+    for arg in args {
+        if arg.spread.is_some() {
+            return None;
+        }
+        collect_static_style_ref_from_tuple_expr(&arg.expr, collector, &mut styles)?;
+    }
+    Some(styles)
+}
+
+fn collect_static_style_ref_from_tuple_expr(
+    expression: &Expr,
+    collector: &StaticStyleTupleCollector,
+    styles: &mut Vec<StaticStyleRef>,
+) -> Option<()> {
+    if is_falsy_style_expression(expression) {
+        return Some(());
+    }
+
+    match expression {
+        Expr::Member(_) => {
+            styles.push(resolve_static_style_ref_for_tuple_analysis(
+                expression, collector,
+            )?);
+            Some(())
+        }
+        Expr::Array(array) => {
+            for element in &array.elems {
+                let Some(element) = element else {
+                    continue;
+                };
+                if element.spread.is_some() {
+                    return None;
+                }
+                collect_static_style_ref_from_tuple_expr(&element.expr, collector, styles)?;
+            }
+            Some(())
+        }
+        Expr::Paren(paren) => {
+            collect_static_style_ref_from_tuple_expr(&paren.expr, collector, styles)
+        }
+        _ => None,
+    }
+}
+
+fn collect_static_style_refs_for_tuple_analysis(
+    expression: &Expr,
+    collector: &StaticStyleTupleCollector,
+    refs: &mut Vec<StaticStyleRef>,
+    groups: &mut HashSet<String>,
+) {
+    if let Some(style_ref) = resolve_static_style_ref_for_tuple_analysis(expression, collector) {
+        refs.push(style_ref);
+        return;
+    }
+
+    expression.visit_with(&mut StaticStyleRefCollector {
+        tuple_collector: collector,
+        refs,
+        groups,
+    });
+}
+
+struct StaticStyleRefCollector<'a, 'b> {
+    tuple_collector: &'a StaticStyleTupleCollector<'a>,
+    refs: &'b mut Vec<StaticStyleRef>,
+    groups: &'b mut HashSet<String>,
+}
+
+impl Visit for StaticStyleRefCollector<'_, '_> {
+    fn visit_binding_ident(&mut self, _binding: &BindingIdent) {}
+
+    fn visit_ident(&mut self, ident: &Ident) {
+        let group_name = ident.sym.to_string();
+        if self.tuple_collector.is_visible_style_group(&group_name) {
+            self.groups.insert(group_name);
+        }
+    }
+
+    fn visit_member_expr(&mut self, member: &MemberExpr) {
+        if let Some(style_ref) =
+            resolve_member_static_style_ref_for_tuple_analysis(member, self.tuple_collector)
+        {
+            self.refs.push(style_ref);
+            return;
+        }
+
+        if let Expr::Ident(object) = &*member.obj {
+            let group_name = object.sym.to_string();
+            if self.tuple_collector.is_visible_style_group(&group_name) {
+                self.groups.insert(group_name);
+                member.prop.visit_with(self);
+                return;
+            }
+        }
+
+        member.visit_children_with(self);
+    }
+}
+
+fn resolve_static_style_ref_for_tuple_analysis(
+    expression: &Expr,
+    collector: &StaticStyleTupleCollector,
+) -> Option<StaticStyleRef> {
+    let Expr::Member(member) = expression else {
+        return None;
+    };
+    resolve_member_static_style_ref_for_tuple_analysis(member, collector)
+}
+
+fn resolve_member_static_style_ref_for_tuple_analysis(
+    member: &MemberExpr,
+    collector: &StaticStyleTupleCollector,
+) -> Option<StaticStyleRef> {
+    let Expr::Ident(object) = &*member.obj else {
+        return None;
+    };
+    let group_name = object.sym.to_string();
+    if !collector.is_visible_style_group(&group_name) {
+        return None;
+    }
+    let style_name = member_prop_to_string(&member.prop)?;
+    collector
+        .static_style_members
+        .get(&group_name)?
+        .contains(&style_name)
+        .then_some(StaticStyleRef {
+            group_name,
+            style_name,
+        })
+}
+
+fn static_style_member_key(style: &StaticStyleRef) -> String {
+    format!("{}\0{}", style.group_name, style.style_name)
+}
+
 fn collect_static_style_refs(
     expression: &Expr,
     transform: &NanoCssTransform,
@@ -2201,6 +2752,14 @@ fn collect_static_style_refs(
         Expr::Paren(paren) => collect_static_style_refs(&paren.expr, transform, styles),
         _ => None,
     }
+}
+
+fn static_style_refs_cache_key(styles: &[StaticStyleRef]) -> String {
+    styles
+        .iter()
+        .map(|style| format!("{}.{}", style.group_name, style.style_name))
+        .collect::<Vec<_>>()
+        .join("\0")
 }
 
 fn dedupe_adjacent_static_style_refs(styles: &mut Vec<StaticStyleRef>) {
@@ -4384,6 +4943,7 @@ mod tests {
                 override: { opacity: 0.5 }
               });
               const rootProps = css.props(styles.base, styles.override);
+              const otherProps = css.props(styles.base, styles.override);
             "#,
         );
         let mut transform = NanoCssTransform::new(debug_options(), "src/app.tsx".to_string());
@@ -4409,6 +4969,7 @@ mod tests {
                 override: { color: 'blue', opacity: 0.5 }
               });
               const rootProps = css.props(styles.base, styles.override);
+              const otherProps = css.props(styles.base, styles.override);
             "#,
         );
         let mut transform = NanoCssTransform::new(debug_options(), "src/app.tsx".to_string());
@@ -4802,6 +5363,7 @@ mod tests {
                 active: { color: 'red' }
               });
               const rootProps = css.props([styles.root, [false, styles.active], undefined]);
+              const otherProps = css.props([styles.root, [false, styles.active], undefined]);
             "#,
         );
         let mut transform = NanoCssTransform::new(debug_options(), "src/app.tsx".to_string());

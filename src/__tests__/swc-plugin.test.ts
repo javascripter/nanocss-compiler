@@ -136,13 +136,19 @@ describe('nanocss swc plugin', () => {
         }
       `),
     ).toMatchInlineSnapshot(`
-      "const _stylesAB = {
+      "const _stylesA = {
           marginLeft: 0,
+          color: 'red'
+      };
+      const _stylesB = {
           marginRight: 8,
           color: 'blue'
       };
       function Comp() {
-          return <div style={_stylesAB}/>;
+          return <div style={{
+              ..._stylesA,
+              ..._stylesB
+          }}/>;
       }
       "
     `)
@@ -184,6 +190,99 @@ describe('nanocss swc plugin', () => {
       }
       "
     `)
+  })
+
+  it('does not merge overlapping static props combinations', () => {
+    const output = transform(`
+      import { css } from 'nanocss-compiler'
+
+      const styles = css.create({
+        a: {
+          opacity: 1,
+        },
+        b: {
+          display: 'flex',
+        },
+        c: {
+          color: 'red',
+        },
+      })
+
+      function Comp() {
+        return (
+          <>
+            <div {...css.props(styles.a, styles.b, styles.c)} />
+            <span {...css.props(styles.b, styles.c)} />
+            <button {...css.props(styles.a, styles.b)} />
+          </>
+        )
+      }
+    `)
+
+    expect(output).toContain('..._stylesA')
+    expect(output).toContain('..._stylesB')
+    expect(output).toContain('..._stylesC')
+    expect(output).not.toContain('_stylesAB')
+    expect(output).not.toContain('_stylesBC')
+    expect(output).not.toContain('_stylesABC')
+  })
+
+  it('does not merge repeated static props combinations with non-static member usage', () => {
+    const output = transform(`
+      import { css } from 'nanocss-compiler'
+
+      const styles = css.create({
+        a: {
+          opacity: 1,
+        },
+        b: {
+          display: 'flex',
+        },
+      })
+
+      function Comp() {
+        return (
+          <>
+            <div {...css.props(styles.a, styles.b)} />
+            <span {...css.props(styles.a, styles.b)} />
+            <button {...css.props(isActive && styles.a)} />
+          </>
+        )
+      }
+    `)
+
+    expect(output).toContain('..._stylesA')
+    expect(output).toContain('..._stylesB')
+    expect(output).not.toContain('_stylesAB')
+  })
+
+  it('does not merge repeated static props combinations with dynamic group member usage', () => {
+    const output = transform(`
+      import { css } from 'nanocss-compiler'
+
+      const styles = css.create({
+        a: {
+          opacity: 1,
+        },
+        b: {
+          display: 'flex',
+        },
+      })
+
+      function Comp() {
+        return (
+          <>
+            <div {...css.props(styles.a, styles.b)} />
+            <span {...css.props(styles.a, styles.b)} />
+            <button {...css.props(styles[getStyleName()])} />
+          </>
+        )
+      }
+    `)
+
+    expect(output).toContain('..._stylesA')
+    expect(output).toContain('..._stylesB')
+    expect(output).not.toContain('_stylesAB')
   })
 
   it('dedupes adjacent repeated static style refs', () => {
@@ -231,12 +330,17 @@ describe('nanocss swc plugin', () => {
         }
       `),
     ).toMatchInlineSnapshot(`
-      "const _fooStylesBarBaz = {
-          opacity: 1,
+      "const _fooStylesBar = {
+          opacity: 1
+      };
+      const _fooStylesBaz = {
           color: 'red'
       };
       function Comp() {
-          return <div style={_fooStylesBarBaz}/>;
+          return <div style={{
+              ..._fooStylesBar,
+              ..._fooStylesBaz
+          }}/>;
       }
       "
     `)
@@ -1658,12 +1762,17 @@ describe('nanocss swc plugin', () => {
       `),
     ).toMatchInlineSnapshot(`
       "import { colors } from './colors.css';
-      const _stylesAB = {
-          [colors.primary]: 'red',
+      const _stylesA = {
+          [colors.primary]: 'red'
+      };
+      const _stylesB = {
           color: 'blue'
       };
       function Comp() {
-          return <div style={_stylesAB}/>;
+          return <div style={{
+              ..._stylesA,
+              ..._stylesB
+          }}/>;
       }
       "
     `)
@@ -1866,7 +1975,10 @@ describe('nanocss swc plugin', () => {
         }
       `),
     ).toMatchInlineSnapshot(`
-      "const _stylesAB = {
+      "const _stylesA = {
+          color: 'red'
+      };
+      const _stylesB = {
           color: null
       };
       const _stylesC = {
@@ -1874,7 +1986,10 @@ describe('nanocss swc plugin', () => {
       };
       function Comp() {
           return <>
-                    <div style={_stylesAB}/>
+                    <div style={{
+              ..._stylesA,
+              ..._stylesB
+          }}/>
                     <span style={_stylesC}/>
                   </>;
       }
@@ -2768,12 +2883,17 @@ describe('nanocss swc plugin', () => {
         }
       `),
     ).toMatchInlineSnapshot(`
-      "const _stylesAB = {
-          marginLeft: 0,
+      "const _stylesA = {
+          marginLeft: 0
+      };
+      const _stylesB = {
           marginRight: 8
       };
       function Comp() {
-          return <div style={_stylesAB}/>;
+          return <div style={{
+              ..._stylesA,
+              ..._stylesB
+          }}/>;
       }
       "
     `)
@@ -2987,13 +3107,13 @@ describe('nanocss swc plugin', () => {
       const _stylesB = {
           opacity: 0.5
       };
-      const _stylesAB = {
-          opacity: 0.5
-      };
       function Comp() {
           return <>
                     <div style={_stylesB}/>
-                    <span style={_stylesAB}/>
+                    <span style={{
+              ..._stylesA,
+              ..._stylesB
+          }}/>
                   </>;
       }
       "
@@ -3203,13 +3323,19 @@ describe('nanocss swc plugin', () => {
         }
       `),
     ).toMatchInlineSnapshot(`
-      "const _stylesBaseOverride = {
+      "const _stylesBase = {
           color: before(),
+          opacity: 1
+      };
+      const _stylesOverride = {
           color: 'blue',
           opacity: 0.5
       };
       function Comp() {
-          return <div style={_stylesBaseOverride}/>;
+          return <div style={{
+              ..._stylesBase,
+              ..._stylesOverride
+          }}/>;
       }
       "
     `)
