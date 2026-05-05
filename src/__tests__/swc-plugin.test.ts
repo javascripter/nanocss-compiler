@@ -3315,14 +3315,93 @@ describe('nanocss swc plugin', () => {
         }
       `),
     ).toMatchInlineSnapshot(`
+      "function Comp({ styles }) {
+          return <div style={styles.root}/>;
+      }
+      "
+    `)
+  })
+
+  it('prunes unused local style members from retained groups', () => {
+    expect(
+      transform(`
+        import { css } from 'nanocss-compiler'
+
+        const styles = css.create({
+          root: {
+            opacity: 1,
+          },
+          unused: {
+            color: expensiveColor(),
+          },
+        })
+
+        console.log(styles.root)
+      `),
+    ).toMatchInlineSnapshot(`
       "const styles = {
           root: {
               opacity: 1
           }
       };
-      function Comp({ styles }) {
-          return <div style={styles.root}/>;
-      }
+      console.log(styles.root);
+      "
+    `)
+  })
+
+  it('prunes unused local dynamic style members from retained groups', () => {
+    expect(
+      transform(`
+        import { css } from 'nanocss-compiler'
+
+        const styles = css.create({
+          root: {
+            opacity: 1,
+          },
+          unused: (width) => ({
+            width,
+          }),
+        })
+
+        console.log(styles.root)
+      `),
+    ).toMatchInlineSnapshot(`
+      "const styles = {
+          root: {
+              opacity: 1
+          }
+      };
+      console.log(styles.root);
+      "
+    `)
+  })
+
+  it('keeps local style members for dynamic group member access', () => {
+    expect(
+      transform(`
+        import { css } from 'nanocss-compiler'
+
+        const styles = css.create({
+          root: {
+            opacity: 1,
+          },
+          fallback: {
+            color: 'red',
+          },
+        })
+
+        console.log(styles[getStyleName()])
+      `),
+    ).toMatchInlineSnapshot(`
+      "const styles = {
+          root: {
+              opacity: 1
+          },
+          fallback: {
+              color: 'red'
+          }
+      };
+      console.log(styles[getStyleName()]);
       "
     `)
   })
@@ -4544,6 +4623,9 @@ describe('nanocss swc plugin', () => {
           root: {
             opacity: 1,
           },
+          unused: {
+            color: 'red',
+          },
           dynamic: (width) => ({
             width,
           }),
@@ -4553,6 +4635,9 @@ describe('nanocss swc plugin', () => {
       "export const styles = {
           root: {
               opacity: 1
+          },
+          unused: {
+              color: 'red'
           },
           dynamic: (width)=>({
                   width

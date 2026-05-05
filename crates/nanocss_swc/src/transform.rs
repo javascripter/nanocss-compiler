@@ -358,7 +358,8 @@ impl<'a> NanoCssTransform<'a> {
             return;
         }
 
-        let used = collect_used_style_identifiers(module, &self.style_group_names);
+        let usage = collect_style_group_usage(module, &self.style_group_names);
+        let used = usage.used_groups();
         let mut remove_indices = Vec::new();
         for (index, item) in module.body.iter().enumerate() {
             let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var_decl))) = item else {
@@ -385,6 +386,50 @@ impl<'a> NanoCssTransform<'a> {
 
         for index in remove_indices.into_iter().rev() {
             module.body.remove(index);
+        }
+    }
+
+    fn prune_unused_style_members(&self, module: &mut Module) {
+        if self.style_group_names.is_empty() {
+            return;
+        }
+
+        let usage = collect_style_group_usage(module, &self.style_group_names);
+        for item in &mut module.body {
+            let ModuleItem::Stmt(Stmt::Decl(Decl::Var(var_decl))) = item else {
+                continue;
+            };
+            if var_decl.decls.len() != 1 {
+                continue;
+            }
+            let Some(name) = var_decl.decls[0]
+                .name
+                .as_ident()
+                .map(|binding| binding.id.sym.to_string())
+            else {
+                continue;
+            };
+            if !self.style_group_names.contains(&name) || usage.unsafe_groups.contains(&name) {
+                continue;
+            }
+            let Some(used_members) = usage.used_members.get(&name) else {
+                continue;
+            };
+            let Some(Expr::Object(object)) = var_decl.decls[0].init.as_deref_mut() else {
+                continue;
+            };
+
+            object.props.retain(|property| {
+                let PropOrSpread::Prop(property) = property else {
+                    return true;
+                };
+                let Prop::KeyValue(property) = &**property else {
+                    return true;
+                };
+                prop_name_to_string(&property.key)
+                    .map(|member_name| used_members.contains(&member_name))
+                    .unwrap_or(true)
+            });
         }
     }
 
@@ -1018,6 +1063,7 @@ impl VisitMut for NanoCssTransform<'_> {
         module.visit_mut_children_with(self);
         self.insert_pending_html_default_styles(module);
         self.insert_pending_style_declarations(module);
+        self.prune_unused_style_members(module);
         self.remove_unused_style_declarations(module);
         self.remove_unused_simple_constant_declarations(module);
         remove_unused_nanocss_imports(module, &self.options.import_sources);
@@ -2218,22 +2264,6 @@ fn expr_may_have_side_effects(expression: &Expr) -> bool {
     }
 }
 
-fn collect_used_style_identifiers(module: &Module, targets: &HashSet<String>) -> HashSet<String> {
-    let mut collector = StyleIdentifierUsageCollector {
-        targets,
-        used: HashSet::new(),
-    };
-
-    for item in &module.body {
-        if matches!(item, ModuleItem::ModuleDecl(ModuleDecl::Import(_))) {
-            continue;
-        }
-        item.visit_with(&mut collector);
-    }
-
-    collector.used
-}
-
 fn collect_used_style_identifiers_in_statements(
     statements: &[Stmt],
     targets: &HashSet<String>,
@@ -2263,6 +2293,182 @@ impl Visit for StyleIdentifierUsageCollector<'_> {
         if self.targets.contains(&name) {
             self.used.insert(name);
         }
+    }
+}
+
+struct StyleGroupUsage {
+    used_members: HashMap<String, HashSet<String>>,
+    unsafe_groups: HashSet<String>,
+}
+
+impl StyleGroupUsage {
+    fn used_groups(&self) -> HashSet<String> {
+        self.used_members
+            .keys()
+            .cloned()
+            .chain(self.unsafe_groups.iter().cloned())
+            .collect()
+    }
+}
+
+fn collect_style_group_usage(module: &Module, targets: &HashSet<String>) -> StyleGroupUsage {
+    let mut collector = StyleGroupUsageCollector {
+        targets,
+        used_members: HashMap::new(),
+        unsafe_groups: HashSet::new(),
+        shadowed: Vec::new(),
+    };
+
+    for item in &module.body {
+        if matches!(item, ModuleItem::ModuleDecl(ModuleDecl::Import(_))) {
+            continue;
+        }
+        item.visit_with(&mut collector);
+    }
+
+    StyleGroupUsage {
+        used_members: collector.used_members,
+        unsafe_groups: collector.unsafe_groups,
+    }
+}
+
+struct StyleGroupUsageCollector<'a> {
+    targets: &'a HashSet<String>,
+    used_members: HashMap<String, HashSet<String>>,
+    unsafe_groups: HashSet<String>,
+    shadowed: Vec<String>,
+}
+
+impl StyleGroupUsageCollector<'_> {
+    fn is_visible_target(&self, name: &str) -> bool {
+        self.targets.contains(name) && !self.shadowed.iter().any(|shadowed| shadowed == name)
+    }
+
+    fn with_shadowed_names(&mut self, shadowed: HashSet<String>, visit: impl FnOnce(&mut Self)) {
+        let previous_len = self.shadowed.len();
+        self.shadowed.extend(shadowed);
+        visit(self);
+        self.shadowed.truncate(previous_len);
+    }
+
+    fn collect_function_shadowed_names(&self, function: &Function) -> HashSet<String> {
+        let mut shadowed = HashSet::new();
+        for param in &function.params {
+            collect_shadowed_css_names(&param.pat, self.targets, &mut shadowed);
+        }
+        if let Some(body) = &function.body {
+            collect_shadowed_var_names_from_function_body(body, self.targets, &mut shadowed);
+        }
+        shadowed
+    }
+
+    fn collect_arrow_shadowed_names(&self, arrow: &ArrowExpr) -> HashSet<String> {
+        let mut shadowed = HashSet::new();
+        for param in &arrow.params {
+            collect_shadowed_css_names(param, self.targets, &mut shadowed);
+        }
+        if let BlockStmtOrExpr::BlockStmt(body) = &*arrow.body {
+            collect_shadowed_var_names_from_function_body(body, self.targets, &mut shadowed);
+        }
+        shadowed
+    }
+}
+
+impl Visit for StyleGroupUsageCollector<'_> {
+    fn visit_binding_ident(&mut self, _binding: &BindingIdent) {}
+
+    fn visit_ident(&mut self, ident: &Ident) {
+        let name = ident.sym.to_string();
+        if self.is_visible_target(&name) {
+            self.unsafe_groups.insert(name);
+        }
+    }
+
+    fn visit_member_expr(&mut self, member: &MemberExpr) {
+        if let Expr::Ident(object) = &*member.obj {
+            let group_name = object.sym.to_string();
+            if self.is_visible_target(&group_name) {
+                if let Some(member_name) = member_prop_to_string(&member.prop) {
+                    self.used_members
+                        .entry(group_name)
+                        .or_default()
+                        .insert(member_name);
+                } else {
+                    self.unsafe_groups.insert(group_name);
+                    member.prop.visit_with(self);
+                }
+                return;
+            }
+        }
+
+        member.visit_children_with(self);
+    }
+
+    fn visit_function(&mut self, function: &Function) {
+        let shadowed = self.collect_function_shadowed_names(function);
+        self.with_shadowed_names(shadowed, |collector| {
+            function.visit_children_with(collector);
+        });
+    }
+
+    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+        let shadowed = self.collect_arrow_shadowed_names(arrow);
+        self.with_shadowed_names(shadowed, |collector| {
+            arrow.visit_children_with(collector);
+        });
+    }
+
+    fn visit_block_stmt(&mut self, block: &BlockStmt) {
+        let mut shadowed = HashSet::new();
+        for statement in &block.stmts {
+            collect_shadowed_css_names_from_statement(statement, self.targets, &mut shadowed);
+        }
+        self.with_shadowed_names(shadowed, |collector| {
+            block.visit_children_with(collector);
+        });
+    }
+
+    fn visit_catch_clause(&mut self, clause: &CatchClause) {
+        let mut shadowed = HashSet::new();
+        if let Some(param) = &clause.param {
+            collect_shadowed_css_names(param, self.targets, &mut shadowed);
+        }
+        self.with_shadowed_names(shadowed, |collector| {
+            clause.visit_children_with(collector);
+        });
+    }
+
+    fn visit_for_stmt(&mut self, statement: &ForStmt) {
+        let mut shadowed = HashSet::new();
+        if let Some(init) = &statement.init {
+            match init {
+                VarDeclOrExpr::VarDecl(declaration) => {
+                    collect_shadowed_names_from_var_decl(declaration, self.targets, &mut shadowed);
+                }
+                VarDeclOrExpr::Expr(_) => {}
+                #[cfg(swc_ast_unknown)]
+                _ => panic!("[nanocss] Unknown SWC for init."),
+            }
+        }
+        self.with_shadowed_names(shadowed, |collector| {
+            statement.visit_children_with(collector);
+        });
+    }
+
+    fn visit_for_in_stmt(&mut self, statement: &ForInStmt) {
+        let mut shadowed = HashSet::new();
+        collect_shadowed_names_from_for_head(&statement.left, self.targets, &mut shadowed);
+        self.with_shadowed_names(shadowed, |collector| {
+            statement.visit_children_with(collector);
+        });
+    }
+
+    fn visit_for_of_stmt(&mut self, statement: &ForOfStmt) {
+        let mut shadowed = HashSet::new();
+        collect_shadowed_names_from_for_head(&statement.left, self.targets, &mut shadowed);
+        self.with_shadowed_names(shadowed, |collector| {
+            statement.visit_children_with(collector);
+        });
     }
 }
 
@@ -2765,7 +2971,7 @@ mod tests {
         let mut transform = NanoCssTransform::new(debug_options(), "src/app.tsx".to_string());
         module.visit_mut_with(&mut transform);
 
-        let var_decl = get_var_decl(&module, 0);
+        let var_decl = get_jsx_var_decl(&module);
         let init = var_decl.decls[0].init.as_ref().expect("expected init");
         let Expr::JSXElement(element) = &**init else {
             panic!("expected jsx element")
@@ -2793,7 +2999,7 @@ mod tests {
         let mut transform = NanoCssTransform::new(debug_options(), "src/app.tsx".to_string());
         module.visit_mut_with(&mut transform);
 
-        let var_decl = get_var_decl(&module, 0);
+        let var_decl = get_jsx_var_decl(&module);
         let init = var_decl.decls[0].init.as_ref().expect("expected init");
         let Expr::JSXElement(element) = &**init else {
             panic!("expected jsx element")
@@ -2857,7 +3063,7 @@ mod tests {
         );
         module.visit_mut_with(&mut transform);
 
-        let var_decl = get_var_decl(&module, 1);
+        let var_decl = get_jsx_var_decl(&module);
         let init = var_decl.decls[0].init.as_ref().expect("expected init");
         let Expr::JSXElement(element) = &**init else {
             panic!("expected jsx element")
@@ -2891,7 +3097,7 @@ mod tests {
         );
         module.visit_mut_with(&mut transform);
 
-        let var_decl = get_var_decl(&module, 1);
+        let var_decl = get_jsx_var_decl(&module);
         let init = var_decl.decls[0].init.as_ref().expect("expected init");
         let Expr::JSXElement(element) = &**init else {
             panic!("expected jsx element")
@@ -4257,7 +4463,7 @@ mod tests {
         let mut transform = NanoCssTransform::new(debug_options(), "src/app.tsx".to_string());
         module.visit_mut_with(&mut transform);
 
-        let var_decl = get_var_decl(&module, 1);
+        let var_decl = get_jsx_var_decl(&module);
         let init = var_decl.decls[0].init.as_ref().expect("expected init");
         let Expr::JSXElement(element) = &**init else {
             panic!("expected jsx element")
@@ -4359,7 +4565,7 @@ mod tests {
         let mut transform = NanoCssTransform::new(debug_options(), "src/app.tsx".to_string());
         module.visit_mut_with(&mut transform);
 
-        let var_decl = get_var_decl(&module, 1);
+        let var_decl = get_var_decl(&module, 0);
         let init = var_decl.decls[0].init.as_ref().expect("expected init");
         let Expr::JSXElement(element) = &**init else {
             panic!("expected jsx element")
