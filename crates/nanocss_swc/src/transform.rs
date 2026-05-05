@@ -1877,6 +1877,34 @@ fn inline_simple_constants(expression: &mut Expr, constants: &HashMap<String, Ex
     });
 }
 
+fn literal_prop_name_from_expr(expression: &Expr) -> Option<PropName> {
+    match expression {
+        Expr::Lit(Lit::Str(value)) => Some(string_literal_prop_name(value)),
+        Expr::Lit(Lit::Num(value)) => Some(PropName::Num(value.clone())),
+        Expr::Paren(paren) => literal_prop_name_from_expr(&paren.expr),
+        _ => None,
+    }
+}
+
+fn string_literal_prop_name(value: &Str) -> PropName {
+    if let Some(value) = value.value.as_str()
+        && value.chars().next().is_some_and(|character| {
+            character == '_' || character == '$' || character.is_ascii_alphabetic()
+        })
+        && value.chars().all(|character| {
+            character == '_' || character == '$' || character.is_ascii_alphanumeric()
+        })
+    {
+        return PropName::Ident(value.into());
+    }
+
+    PropName::Str(Str {
+        span: DUMMY_SP,
+        value: value.value.clone(),
+        raw: None,
+    })
+}
+
 struct SimpleConstantInliner<'a> {
     constants: &'a HashMap<String, Expr>,
     shadowed: Vec<String>,
@@ -1918,6 +1946,12 @@ impl VisitMut for SimpleConstantInliner<'_> {
     }
 
     fn visit_mut_key_value_prop(&mut self, property: &mut KeyValueProp) {
+        if let PropName::Computed(computed) = &mut property.key {
+            computed.expr.visit_mut_with(self);
+            if let Some(key) = literal_prop_name_from_expr(&computed.expr) {
+                property.key = key;
+            }
+        }
         property.value.visit_mut_with(self);
     }
 

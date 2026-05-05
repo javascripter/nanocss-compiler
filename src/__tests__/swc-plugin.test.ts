@@ -282,9 +282,51 @@ describe('nanocss swc plugin', () => {
     `)
   })
 
+  it('inlines local literal constants in computed style and hook keys', () => {
+    const result = transformWithMetadata(`
+        import { css } from 'nanocss-compiler'
+
+        const property = 'color'
+        const hover = ':hover'
+        const styles = css.create({
+          root: {
+            [property]: {
+              default: 'black',
+              [hover]: 'red',
+            },
+          },
+        })
+
+        function Comp() {
+          return <div {...css.props(styles.root)} />
+        }
+      `)
+
+    expect(result.code).toMatchInlineSnapshot(`
+      "const _stylesRoot = {
+          color: "var(--_hover-mbscpo-1, red) var(--_hover-mbscpo-0, black)"
+      };
+      function Comp() {
+          return <div style={_stylesRoot}/>;
+      }
+      "
+    `)
+    expect((result.metadata as any).nanocss.styleSheet).toMatchInlineSnapshot(`
+      "* {
+        --_hover-mbscpo-0: initial;
+        --_hover-mbscpo-1: ;
+      }
+      *:hover {
+        --_hover-mbscpo-0: ;
+        --_hover-mbscpo-1: initial;
+      }
+      "
+    `)
+  })
+
   it('compiles static keyframes and records css metadata', () => {
     const result = transformWithMetadata(`
-      import { css } from 'nanocss-compiler'
+        import { css } from 'nanocss-compiler'
 
       const fadeIn = css.keyframes({
         '0%': {
@@ -3807,7 +3849,7 @@ describe('nanocss swc plugin', () => {
       transform(`
         import { css } from 'nanocss-compiler'
 
-        const key = 'color'
+        const key = getKey()
         const styles = css.create({
           root: {
             [key]: 'red',
