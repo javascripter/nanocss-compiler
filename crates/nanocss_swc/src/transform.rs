@@ -568,9 +568,15 @@ impl<'a> NanoCssTransform<'a> {
     }
 
     fn merge_static_styles(&self, styles: &[StaticStyleRef]) -> Expr {
-        let mut props = HashMap::new();
+        struct MergedProperty {
+            keep: bool,
+            key: Option<String>,
+            prop: PropOrSpread,
+        }
+
+        let mut props = Vec::<MergedProperty>::new();
+        let mut prop_by_key = HashMap::<String, usize>::new();
         let mut computed_index = 0;
-        let mut property_index = 0;
 
         for style_ref in styles {
             let Some(Expr::Object(style)) = self
@@ -592,17 +598,31 @@ impl<'a> NanoCssTransform<'a> {
                     Prop::Shorthand(identifier) => Some(identifier.sym.to_string()),
                     _ => None,
                 };
-                props.insert(key, (property_index, prop.clone()));
-                property_index += 1;
+                if let Some(key) = key.as_ref()
+                    && let Some(previous_index) = prop_by_key.get(key).copied()
+                    && !prop_or_spread_may_have_side_effects(&props[previous_index].prop)
+                {
+                    props[previous_index].keep = false;
+                }
+                let index = props.len();
+                if let Some(key) = key.as_ref() {
+                    prop_by_key.insert(key.clone(), index);
+                }
+                props.push(MergedProperty {
+                    keep: true,
+                    key,
+                    prop: prop.clone(),
+                });
             }
         }
 
-        let mut props = props.into_values().collect::<Vec<_>>();
-        props.sort_by_key(|(index, _)| *index);
-
         Expr::Object(ObjectLit {
             span: DUMMY_SP,
-            props: props.into_iter().map(|(_, prop)| prop).collect(),
+            props: props
+                .into_iter()
+                .filter(|property| property.keep || property.key.is_none())
+                .map(|property| property.prop)
+                .collect(),
         })
     }
 
@@ -1910,6 +1930,42 @@ fn merge_property_key(key: &PropName, computed_index: &mut usize) -> Option<Stri
     }
 
     prop_name_to_string(key)
+}
+
+fn prop_or_spread_may_have_side_effects(property: &PropOrSpread) -> bool {
+    let PropOrSpread::Prop(property) = property else {
+        return true;
+    };
+
+    match &**property {
+        Prop::KeyValue(property) => expr_may_have_side_effects(&property.value),
+        Prop::Shorthand(_) => false,
+        _ => true,
+    }
+}
+
+fn expr_may_have_side_effects(expression: &Expr) -> bool {
+    match expression {
+        Expr::Lit(_) | Expr::Ident(_) | Expr::This(_) => false,
+        Expr::Paren(expression) => expr_may_have_side_effects(&expression.expr),
+        Expr::Unary(expression) if expression.op != UnaryOp::Delete => {
+            expr_may_have_side_effects(&expression.arg)
+        }
+        Expr::Bin(expression) => {
+            expr_may_have_side_effects(&expression.left)
+                || expr_may_have_side_effects(&expression.right)
+        }
+        Expr::Cond(expression) => {
+            expr_may_have_side_effects(&expression.test)
+                || expr_may_have_side_effects(&expression.cons)
+                || expr_may_have_side_effects(&expression.alt)
+        }
+        Expr::Tpl(expression) => expression
+            .exprs
+            .iter()
+            .any(|expression| expr_may_have_side_effects(expression)),
+        _ => true,
+    }
 }
 
 fn collect_used_style_identifiers(module: &Module, targets: &HashSet<String>) -> HashSet<String> {
@@ -3808,6 +3864,30 @@ mod tests {
             color_index < opacity_index,
             "last duplicate property should move to the end"
         );
+        assert!(!output.contains("opacity: 1"));
+    }
+
+    #[test]
+    fn merged_static_styles_preserve_overwritten_property_side_effects() {
+        let mut module = parse_module(
+            r#"
+              import { css } from 'nanocss-compiler';
+              const styles = css.create({
+                base: { color: before(), opacity: 1 },
+                override: { color: 'blue', opacity: 0.5 }
+              });
+              const rootProps = css.props(styles.base, styles.override);
+            "#,
+        );
+        let mut transform = NanoCssTransform::new(debug_options(), "src/app.tsx".to_string());
+        module.visit_mut_with(&mut transform);
+
+        let output = emit_module(&module);
+        assert!(
+            output.contains("color: before()"),
+            "overwritten effectful value should still evaluate"
+        );
+        assert!(output.contains("color: 'blue'"));
         assert!(!output.contains("opacity: 1"));
     }
 

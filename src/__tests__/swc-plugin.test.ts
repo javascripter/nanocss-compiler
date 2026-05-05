@@ -1870,6 +1870,64 @@ describe('nanocss swc plugin', () => {
       `)
   })
 
+  it('omits hook output for no-op conditional style values', () => {
+    const result = transformWithMetadata(`
+        import { css } from 'nanocss-compiler'
+
+        const styles = css.create({
+          root: {
+            color: {
+              default: 'red',
+              ':hover': 'red',
+            },
+            backgroundColor: {
+              default: 'white',
+              ':hover': {
+                default: 'white',
+                '@media (min-width: 768px)': 'blue',
+              },
+            },
+          },
+        })
+
+        function Comp() {
+          return <div {...css.props(styles.root)} />
+        }
+      `)
+
+    expect(result?.code).toMatchInlineSnapshot(`
+      "const _stylesRoot = {
+          color: "red",
+          backgroundColor: "var(--cond-27myt-1, blue) var(--cond-27myt-0, white)"
+      };
+      function Comp() {
+          return <div style={_stylesRoot}/>;
+      }
+      "
+    `)
+    expect((result?.metadata as any).nanocss.styleSheet).toMatchInlineSnapshot(`
+      "* {
+        --_hover-mbscpo-0: initial;
+        --_hover-mbscpo-1: ;
+        --_media__min-width__768px_-apgmjb-0: initial;
+        --_media__min-width__768px_-apgmjb-1: ;
+        --cond-27myt-0: var(--_hover-mbscpo-0) var(--_media__min-width__768px_-apgmjb-0);
+        --cond-27myt-1: var(--_hover-mbscpo-1, var(--_media__min-width__768px_-apgmjb-1));
+      }
+      *:hover {
+        --_hover-mbscpo-0: ;
+        --_hover-mbscpo-1: initial;
+      }
+      @media (min-width: 768px) {
+        * {
+          --_media__min-width__768px_-apgmjb-0: ;
+          --_media__min-width__768px_-apgmjb-1: initial;
+        }
+      }
+      "
+    `)
+  })
+
   it('infers supports hooks', () => {
     const result = transformWithMetadata(`
         import { css } from 'nanocss-compiler'
@@ -2872,6 +2930,39 @@ describe('nanocss swc plugin', () => {
       after();
       function Comp() {
           return <div style={_stylesRoot}/>;
+      }
+      "
+    `)
+  })
+
+  it('preserves overwritten static style value side effects when merging', () => {
+    expect(
+      transform(`
+        import { css } from 'nanocss-compiler'
+
+        const styles = css.create({
+          base: {
+            color: before(),
+            opacity: 1,
+          },
+          override: {
+            color: 'blue',
+            opacity: 0.5,
+          },
+        })
+
+        function Comp() {
+          return <div {...css.props(styles.base, styles.override)} />
+        }
+      `),
+    ).toMatchInlineSnapshot(`
+      "const _stylesBaseOverride = {
+          color: before(),
+          color: 'blue',
+          opacity: 0.5
+      };
+      function Comp() {
+          return <div style={_stylesBaseOverride}/>;
       }
       "
     `)

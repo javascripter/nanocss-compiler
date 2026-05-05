@@ -70,11 +70,6 @@ impl HookCompiler {
         }
 
         for (conditions, value) in conditional_styles {
-            for condition in &conditions {
-                self.add_hook(condition);
-            }
-
-            let id = self.condition_id(&conditions);
             let fallback = style
                 .get(property_name)
                 .and_then(|value| stringify_compiled_style_value(property_name, value, None))
@@ -84,6 +79,15 @@ impl HookCompiler {
             else {
                 continue;
             };
+            if value == fallback {
+                continue;
+            }
+
+            for condition in &conditions {
+                self.add_hook(condition);
+            }
+
+            let id = self.condition_id(&conditions);
             let (space, _) = self.formatting();
             style.insert(
                 property_name.to_string(),
@@ -472,6 +476,55 @@ mod tests {
         let style_sheet = compiler.style_sheet();
         assert_eq!(style_sheet.matches("--cond-27myt-0:").count(), 1);
         assert_eq!(style_sheet.matches("--cond-27myt-1:").count(), 1);
+    }
+
+    #[test]
+    fn skips_noop_conditional_values() {
+        let mut compiler = HookCompiler::new(true);
+        let compiled = compiler.compile_property(
+            "color",
+            &HookValue::Object(vec![
+                ("default".to_string(), HookValue::String("red".to_string())),
+                (":hover".to_string(), HookValue::String("red".to_string())),
+            ]),
+        );
+
+        assert_eq!(compiled, vec![("color".to_string(), "red".to_string())]);
+        assert!(compiler.style_sheet().is_empty());
+    }
+
+    #[test]
+    fn skips_noop_intermediate_nested_condition_values() {
+        let mut compiler = HookCompiler::new(true);
+        let compiled = compiler.compile_property(
+            "color",
+            &HookValue::Object(vec![
+                (
+                    "default".to_string(),
+                    HookValue::String("black".to_string()),
+                ),
+                (
+                    ":hover".to_string(),
+                    HookValue::Object(vec![
+                        (
+                            "default".to_string(),
+                            HookValue::String("black".to_string()),
+                        ),
+                        (
+                            "@media (min-width: 768px)".to_string(),
+                            HookValue::String("red".to_string()),
+                        ),
+                    ]),
+                ),
+            ]),
+        );
+
+        assert_eq!(compiled.len(), 1);
+        assert!(compiled[0].1.contains("var(--cond-"));
+        assert!(!compiled[0].1.contains("--_hover-mbscpo-1, black"));
+        let style_sheet = compiler.style_sheet();
+        assert!(style_sheet.contains("*:hover"));
+        assert!(style_sheet.contains("@media (min-width: 768px)"));
     }
 
     #[test]
