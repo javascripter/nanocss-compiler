@@ -1,0 +1,21 @@
+[package]
+name = "nanocss_swc"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+swc_core.workspace = true
+swc_sourcemap.workspace = true
+
+[dev-dependencies]
+swc_core = { workspace = true, features = ["ecma_codegen"] }

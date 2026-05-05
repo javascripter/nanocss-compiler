@@ -1,0 +1,22 @@
+[workspace]
+members = ["crates/nanocss_node", "crates/nanocss_swc"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/javascripter/nanocss"
+
+[workspace.dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+swc_core = { version = "65.0.2", features = ["ecma_codegen", "ecma_plugin_transform", "ecma_parser"] }
+swc_sourcemap = "10.0.2"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(swc_ast_unknown)"] }
+
+[profile.release]
+lto = true
+opt-level = "s"
+strip = "symbols"
